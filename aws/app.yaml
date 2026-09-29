@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DeliverMyMedications — application tier on AWS. CloudFront + AWS WAF at the edge, the website served from a
+  private S3 bucket, and the API running on Lambda inside the VPC created by aws/database.yaml. Deploy that
+  stack first. Certificate must be in us-east-1 for CloudFront.
+
+Parameters:
+  ProjectName: { Type: String, Default: delivermymedications }
+  DbStackName: { Type: String, Default: delivermymedications-db }
+  DomainName: { Type: String, Default: delivermymedications.com }
+  CertificateArn:
+    Type: String
+    Description: ACM certificate in us-east-1 covering the domain and www
+  EmailFrom: { Type: String, Default: "DeliverMyMedications <no-reply@delivermymedications.com>" }
+  MailTransport:
+    Type: String
+    Default: gmail
+    AllowedValues: [gmail, ses]
+    Description: "gmail = Google Workspace SMTP relay (covered by your Workspace BAA); ses = Amazon SES"
+  MailAuth:
+    Type: String
+    Default: ip
+    AllowedValues: [ip, user]
+    Description: "ip = Workspace allows the NAT gateway address; user = dedicated mailbox with an app password"
+  MailUser:
+    Type: String
+    Default: ""
+    Description: "Workspace mailbox used for relay when MailAuth=user, e.g. no-reply@delivermymedications.com"
+  OwnerEmail: { Type: String, Default: yaakov@safer.health }
+  SmsOriginationNumber: { Type: String, Default: "", Description: "Pinpoint phone number ARN or ID; blank disables texts" }
+  LiveMode: { Type: String, Default: "true", AllowedValues: ["true", "false"] }
+  PaymentMode: { Type: String, Default: "test", AllowedValues: ["test", "stripe"] }
+
+Conditions:
+  HasSms: !Not [!Equals [!Ref SmsOriginationNumber, ""]]
+
+Resources:
+
+  ##### Website files #####
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-site-${AWS::AccountId}"
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
+      VersioningConfiguration: { Status: Enabled }
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition: { StringEquals: { "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}" } }
+
+  ##### Secrets the application reads at cold start #####
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/app"
+      Description: "Application secrets: GOOGLE_CLIENT_SECRET, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, SHIPSTATION_API_KEY, CARRIER_WEBHOOK_KEY"
+      SecretString: '{"GOOGLE_CLIENT_SECRET":"","STRIPE_SECRET_KEY":"","STRIPE_WEBHOOK_SECRET":"","SHIPSTATION_API_KEY":"","CARRIER_WEBHOOK_KEY":""}'
+
+  ##### API #####
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource:
+                  - !Ref AppSecret
+                  - Fn::ImportValue: !Sub "${DbStackName}-SecretArn"
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: { Fn::ImportValue: !Sub "${DbStackName}-KmsKeyArn" }
+              - Effect: Allow
+                Action: [ses:SendEmail]
+                Resource: "*"
+              - !If
+                - HasSms
+                - { Effect: Allow, Action: ["sms-voice:SendTextMessage"], Resource: "*" }
+                - !Ref AWS::NoValue
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-api"
+      Runtime: nodejs20.x
+      Handler: aws/lambda/handler.handler
+      Role: !GetAtt LambdaRole.Arn
+      MemorySize: 1024
+      Timeout: 29
+      Code:
+        S3Bucket: !Ref SiteBucket           # replaced by the deploy script with the built bundle
+        S3Key: lambda/api.zip
+      VpcConfig:
+        SecurityGroupIds: [{ Fn::ImportValue: !Sub "${DbStackName}-AppSecurityGroup" }]
+        SubnetIds:
+          - { Fn::ImportValue: !Sub "${DbStackName}-SubnetA" }
+          - { Fn::ImportValue: !Sub "${DbStackName}-SubnetB" }
+      Environment:
+        Variables:
+          LIVE_MODE: !Ref LiveMode
+          PAYMENT_MODE: !Ref PaymentMode
+          PUBLIC_URL: !Sub "https://${DomainName}"
+          OWNER_EMAIL: !Ref OwnerEmail
+          ALERT_EMAIL: !Ref OwnerEmail
+          EMAIL_FROM: !Ref EmailFrom
+          MAIL_TRANSPORT: !Ref MailTransport
+          MAIL_AUTH: !Ref MailAuth
+          MAIL_USER: !Ref MailUser
+          ENVIRONMENT: production
+          AUTH_MODE: google
+          STAFF_MFA: "on"
+          DB_SECRET_ARN: { Fn::ImportValue: !Sub "${DbStackName}-SecretArn" }
+          DB_PROXY_ENDPOINT: { Fn::ImportValue: !Sub "${DbStackName}-ProxyEndpoint" }
+          DB_NAME: delivermymedications
+          APP_SECRET_ARN: !Ref AppSecret
+          SMS_ORIGINATION_NUMBER: !Ref SmsOriginationNumber
+
+  ApiUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ApiFunction.Arn
+      AuthType: AWS_IAM                      # only CloudFront may invoke it
+      InvokeMode: BUFFERED
+
+  ApiUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ApiFunction.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      FunctionUrlAuthType: AWS_IAM
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  ##### Scheduled jobs (were Cloudflare cron triggers) #####
+  SlaSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-sla-sweep"
+      ScheduleExpression: "rate(15 minutes)"
+      Targets: [{ Id: api, Arn: !GetAtt ApiFunction.Arn, Input: '{"source":"aws.events","cron":"*/15 * * * *"}' }]
+  SlaPermission:
+    Type: AWS::Lambda::Permission
+    Properties: { FunctionName: !GetAtt ApiFunction.Arn, Action: lambda:InvokeFunction, Principal: events.amazonaws.com, SourceArn: !GetAtt SlaSchedule.Arn }
+
+  MorningSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-morning"
+      ScheduleExpression: "cron(0 10 * * ? *)"
+      Targets: [{ Id: api, Arn: !GetAtt ApiFunction.Arn, Input: '{"source":"aws.events","cron":"0 10 * * *"}' }]
+  MorningPermission:
+    Type: AWS::Lambda::Permission
+    Properties: { FunctionName: !GetAtt ApiFunction.Arn, Action: lambda:InvokeFunction, Principal: events.amazonaws.com, SourceArn: !GetAtt MorningSchedule.Arn }
+
+  ##### Edge #####
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ProjectName}-waf"
+      Scope: CLOUDFRONT
+      DefaultAction: { Allow: {} }
+      VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: !Sub "${ProjectName}-waf" }
+      Rules:
+        - Name: common
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement: { ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesCommonRuleSet } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: common }
+        - Name: bad-inputs
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement: { ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: badinputs }
+        - Name: auth-rate-limit          # protects sign-in and patient links from guessing
+          Priority: 3
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: 300
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  FieldToMatch: { UriPath: {} }
+                  PositionalConstraint: STARTS_WITH
+                  SearchString: "/api/auth"
+                  TextTransformations: [{ Priority: 0, Type: LOWERCASE }]
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: authrate }
+
+  NoCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${ProjectName}-no-cache"
+        DefaultTTL: 0
+        MinTTL: 0
+        MaxTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          CookiesConfig: { CookieBehavior: none }
+          HeadersConfig: { HeaderBehavior: none }
+          QueryStringsConfig: { QueryStringBehavior: none }
+
+  ApiOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${ProjectName}-api-origin"
+        CookiesConfig: { CookieBehavior: all }
+        HeadersConfig: { HeaderBehavior: allViewerExceptHostHeader }
+        QueryStringsConfig: { QueryStringBehavior: all }
+
+  SiteOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig: { Name: !Sub "${ProjectName}-s3", OriginAccessControlOriginType: s3, SigningBehavior: always, SigningProtocol: sigv4 }
+  ApiOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig: { Name: !Sub "${ProjectName}-lambda", OriginAccessControlOriginType: lambda, SigningBehavior: always, SigningProtocol: sigv4 }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Ref ProjectName
+        Aliases: [!Ref DomainName, !Sub "www.${DomainName}"]
+        ViewerCertificate: { AcmCertificateArn: !Ref CertificateArn, SslSupportMethod: sni-only, MinimumProtocolVersion: TLSv1.2_2021 }
+        WebACLId: !GetAtt WebAcl.Arn
+        HttpVersion: http2and3
+        DefaultRootObject: index.html
+        CustomErrorResponses:                       # single-page app: unknown paths return the app
+          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html }
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html }
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOac.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+          - Id: api
+            DomainName: !Select [2, !Split ["/", !GetAtt ApiUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt ApiOac.Id
+            CustomOriginConfig: { OriginProtocolPolicy: https-only, OriginSSLProtocols: [TLSv1.2] }
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6     # CachingOptimized
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03  # SecurityHeadersPolicy
+          Compress: true
+        CacheBehaviors:
+          - { PathPattern: "/api/*", TargetOriginId: api, ViewerProtocolPolicy: https-only, AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE], CachePolicyId: !Ref NoCachePolicy, OriginRequestPolicyId: !Ref ApiOriginRequestPolicy }
+          - { PathPattern: "/auth/*", TargetOriginId: api, ViewerProtocolPolicy: https-only, AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE], CachePolicyId: !Ref NoCachePolicy, OriginRequestPolicyId: !Ref ApiOriginRequestPolicy }
+          - { PathPattern: "/staff/*", TargetOriginId: api, ViewerProtocolPolicy: https-only, AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE], CachePolicyId: !Ref NoCachePolicy, OriginRequestPolicyId: !Ref ApiOriginRequestPolicy }
+          - { PathPattern: "/admin/*", TargetOriginId: api, ViewerProtocolPolicy: https-only, AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE], CachePolicyId: !Ref NoCachePolicy, OriginRequestPolicyId: !Ref ApiOriginRequestPolicy }
+        Logging: { Bucket: !Sub "${ProjectName}-audit-${AWS::AccountId}.s3.amazonaws.com", Prefix: cloudfront/, IncludeCookies: false }
+
+Outputs:
+  DistributionDomain: { Value: !GetAtt Distribution.DomainName, Description: "Point your DNS here" }
+  DistributionId: { Value: !Ref Distribution }
+  SiteBucketName: { Value: !Ref SiteBucket }
+  ApiFunctionName: { Value: !Ref ApiFunction }
+  AppSecretArn: { Value: !Ref AppSecret }

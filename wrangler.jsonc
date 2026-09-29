@@ -1,0 +1,59 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "delivermymedications",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-09-01",
+  "workers_dev": true,
+
+  // Builds src/generated/catalog.json from public/index.html so the server prices match the site.
+  "build": { "command": "node scripts/build.mjs" },
+
+  // The website (public/) is served directly; /api/* and /staff/* run the Worker.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/staff/*", "/auth/*", "/admin/*"]
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "delivermymedications",
+      "database_id": "88a32950-b42c-4a07-8d6a-0f906fcdfda4",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Every 15 minutes: 24-hour clock alerts, patient link reminders. 10:00 UTC daily: auto-ship reminders.
+  "triggers": { "crons": ["*/15 * * * *", "0 10 * * *"] },
+
+  "vars": {
+    "LIVE_MODE": "true",                       // "false" runs the browser-only demo with no database
+    "PAYMENT_MODE": "test",                    // "test" records orders without charging; "stripe" for real cards
+    "PUBLIC_URL": "https://delivermymedications.com",
+    "ALERT_EMAIL": "yaakov@safer.health",
+    "OWNER_EMAIL": "yaakov@safer.health",      // super admin: always an active admin, can do anything, can't be locked out
+    "EMAIL_FROM": "DeliverMyMedications <no-reply@delivermymedications.com>",
+    "STRIPE_PUBLISHABLE_KEY": "",
+    "AUTH_MODE": "google",                     // "google" (sign in on the site), "access" (Cloudflare Access), or "both"
+    "GOOGLE_CLIENT_ID": "334346871310-npo6s7ubip2cv91sd6rnt0350bl7dlmt.apps.googleusercontent.com",
+    "GOOGLE_HD": "safer.health",               // only @safer.health accounts appear in the Google picker
+    "STAFF_MFA": "on",                         // "off" to rely on Google's own 2-step only
+    "ACCESS_TEAM_DOMAIN": "delivermymedications.cloudflareaccess.com",
+    "ACCESS_AUD": "2866185b2040b80761c62e46163d72296d9cb7e2c11a8dc1eef32f885dd543f6",
+    "SS_WAREHOUSE_ID": "",
+    "SS_SERVICE_OVERNIGHT": "",
+    "SS_SERVICE_2DAY": "",
+    "SS_SERVICE_GROUND": "",
+    "SS_PKG_COLD": "package",
+    "SS_PKG_STANDARD": "package",
+    "ENVIRONMENT": "production"
+  },
+  // Secrets (set in the dashboard or with `npx wrangler secret put NAME`, never in this file):
+  // ANTHROPIC_API_KEY (powers the "what's going on?" assistant; without it the site falls back to keyword matching),
+  // GOOGLE_CLIENT_SECRET, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, RESEND_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM,
+  // SHIPSTATION_API_KEY, CARRIER_WEBHOOK_KEY
+
+  "observability": { "enabled": true }
+}

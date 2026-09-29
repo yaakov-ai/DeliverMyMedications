@@ -1,0 +1,8 @@
+# Copy to .dev.vars for local development (never commit .dev.vars).
+LIVE_MODE=true
+PAYMENT_MODE=test
+ENVIRONMENT=development
+DEV_STAFF_EMAIL=yaakov@safer.health
+PUBLIC_URL=http://localhost:8787
+# STRIPE_SECRET_KEY=sk_test_...
+# RESEND_API_KEY=re_...

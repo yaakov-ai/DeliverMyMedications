@@ -1,0 +1,22 @@
+{
+  "name": "delivermymedications",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "wrangler d1 migrations apply delivermymedications --local && wrangler dev --env-file .dev.vars",
+    "deploy": "wrangler d1 migrations apply delivermymedications --remote && wrangler deploy",
+    "db:migrate": "wrangler d1 migrations apply delivermymedications --remote",
+    "test": "node scripts/build.mjs && node test/smoke.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.40.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-pinpoint-sms-voice-v2": "^3.1140.0",
+    "@aws-sdk/client-secrets-manager": "^3.1140.0",
+    "@aws-sdk/client-sesv2": "^3.1140.0",
+    "nodemailer": "^10.0.10",
+    "postgres": "^3.4.9"
+  }
+}

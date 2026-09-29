@@ -1,0 +1,394 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DeliverMyMedications — HIPAA-eligible PostgreSQL database for patient, prescription and pharmacy records.
+  Creates a private VPC, an encrypted Aurora Serverless v2 PostgreSQL cluster, RDS Proxy, a customer-managed
+  KMS key, credentials in Secrets Manager with rotation, an append-only audit-archive bucket with Object Lock,
+  and CloudWatch alarms. Every service here is HIPAA-eligible and covered by the AWS BAA you accept in AWS Artifact.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: delivermymedications
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+  MinCapacity:
+    Type: Number
+    Default: 0.5
+    Description: Aurora Serverless v2 minimum capacity units (0.5 is about $45/month idle)
+  MaxCapacity:
+    Type: Number
+    Default: 4
+  AuditRetentionYears:
+    Type: Number
+    Default: 7
+    Description: Object Lock retention for archived audit logs. HIPAA requires 6; several states want more.
+  AlertEmail:
+    Type: String
+    Default: yaakov@safer.health
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR allowed to reach the database through the bastion path. Leave as-is only if you attach
+      Session Manager instead of opening a port; a database holding PHI should never be publicly reachable.
+
+Resources:
+
+  ##### Network: private by default, no internet gateway on the data subnets #####
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-vpc" }]
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-private-a" }]
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-private-b" }]
+
+  # Outbound access for Stripe, Google, ShipStation. Nothing inbound.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway }
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.9.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties: { RouteTableId: !Ref PublicRouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway }
+  PublicAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet, RouteTableId: !Ref PublicRouteTable }
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }        # fixed outbound address: allow it in Workspace SMTP relay
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties: { AllocationId: !GetAtt NatEip.AllocationId, SubnetId: !Ref PublicSubnet }
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref PrivateRouteTable, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGateway }
+  PrivateAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetA, RouteTableId: !Ref PrivateRouteTable }
+  PrivateAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetB, RouteTableId: !Ref PrivateRouteTable }
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the PHI database
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL access from the application only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 10.42.0.0/16
+          Description: Application subnets inside the VPC
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-db-sg" }]
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application (Lambda) network interfaces
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-app-sg" }]
+
+  # AWS service endpoints stay on the private network: PHI never touches the public internet.
+  SecretsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+  KmsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.kms"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+  EmailEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.email-smtp"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC interface endpoints
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 10.42.0.0/16, Description: HTTPS from inside the VPC }
+
+  ##### Encryption: customer-managed key, so decryption is a second authorization gate #####
+  DbKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    Properties:
+      Description: !Sub "${ProjectName} PHI database encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRoot
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowRdsAndSecrets
+            Effect: Allow
+            Principal: { Service: [rds.amazonaws.com, secretsmanager.amazonaws.com] }
+            Action: [kms:Encrypt, kms:Decrypt, kms:ReEncrypt*, kms:GenerateDataKey*, kms:DescribeKey, kms:CreateGrant]
+            Resource: "*"
+  DbKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-db"
+      TargetKeyId: !Ref DbKey
+
+  ##### Credentials: generated, stored, rotated — never in code #####
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/${Environment}/db"
+      Description: Aurora PostgreSQL credentials for the application
+      KmsKeyId: !Ref DbKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"dmm_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\ '
+
+  ##### Database: Aurora Serverless v2, encrypted, backed up, never public #####
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: "15.5"
+      DatabaseName: delivermymedications
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!GetAtt DbSecurityGroup.GroupId]
+      StorageEncrypted: true
+      KmsKeyId: !Ref DbKey
+      BackupRetentionPeriod: 35
+      PreferredBackupWindow: "07:00-08:00"          # 3 AM ET, outside pharmacy hours
+      PreferredMaintenanceWindow: "sun:08:30-sun:09:30"
+      DeletionProtection: true
+      CopyTagsToSnapshot: true
+      EnableCloudwatchLogsExports: [postgresql]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+      Tags:
+        - { Key: DataClassification, Value: PHI }
+        - { Key: Environment, Value: !Ref Environment }
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref DbKey
+      PerformanceInsightsRetentionPeriod: 7
+
+  SecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref DbCluster
+      TargetType: AWS::RDS::DBCluster
+
+  SecretRotation:
+    Type: AWS::SecretsManager::RotationSchedule
+    DependsOn: SecretAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      HostedRotationLambda:
+        RotationType: PostgreSQLSingleUser
+        RotationLambdaName: !Sub "${ProjectName}-db-rotation"
+        VpcSecurityGroupIds: !GetAtt DbSecurityGroup.GroupId
+        VpcSubnetIds: !Join [",", [!Ref SubnetA, !Ref SubnetB]]
+      RotationRules:
+        AutomaticallyAfterDays: 60
+
+  ##### Connection pooling: the app opens many short connections #####
+  ProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: rds.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: [secretsmanager:GetSecretValue], Resource: !Ref DbSecret }
+              - { Effect: Allow, Action: [kms:Decrypt], Resource: !GetAtt DbKey.Arn }
+
+  DbProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: !Sub "${ProjectName}-proxy"
+      EngineFamily: POSTGRESQL
+      RequireTLS: true                              # PHI in transit, always
+      IdleClientTimeout: 1800
+      Auth: [{ AuthScheme: SECRETS, SecretArn: !Ref DbSecret, IAMAuth: DISABLED }]
+      RoleArn: !GetAtt ProxyRole.Arn
+      VpcSubnetIds: [!Ref SubnetA, !Ref SubnetB]
+      VpcSecurityGroupIds: [!GetAtt DbSecurityGroup.GroupId]
+
+  ProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref DbProxy
+      DBClusterIdentifiers: [!Ref DbCluster]
+      TargetGroupName: default
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 90
+        MaxIdleConnectionsPercent: 50
+
+  ##### Audit archive: write once, delete never, for the six-year retention rule #####
+  AuditBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-audit-${AWS::AccountId}"
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: COMPLIANCE
+            Years: !Ref AuditRetentionYears
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: aws:kms, KMSMasterKeyID: !Ref DbKey }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: { Status: Enabled }
+
+  ##### Alerts #####
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-db-alerts"
+      Subscription: [{ Protocol: email, Endpoint: !Ref AlertEmail }]
+
+  CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database CPU high for 10 minutes
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBClusterIdentifier, Value: !Ref DbCluster }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+
+  ConnectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Unusual connection count — possible credential misuse
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions: [{ Name: DBClusterIdentifier, Value: !Ref DbCluster }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 150
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  ClusterEndpoint:
+    Description: Writer endpoint (the application uses the proxy endpoint instead)
+    Value: !GetAtt DbCluster.Endpoint.Address
+  ProxyEndpoint:
+    Description: Connect the application here
+    Value: !GetAtt DbProxy.Endpoint
+    Export: { Name: !Sub "${AWS::StackName}-ProxyEndpoint" }
+  SecretArn:
+    Description: Database credentials
+    Value: !Ref DbSecret
+    Export: { Name: !Sub "${AWS::StackName}-SecretArn" }
+  AuditBucketName:
+    Value: !Ref AuditBucket
+    Export: { Name: !Sub "${AWS::StackName}-AuditBucket" }
+  KmsKeyArn:
+    Value: !GetAtt DbKey.Arn
+    Export: { Name: !Sub "${AWS::StackName}-KmsKeyArn" }
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${AWS::StackName}-VpcId" }
+  SubnetA:
+    Value: !Ref SubnetA
+    Export: { Name: !Sub "${AWS::StackName}-SubnetA" }
+  SubnetB:
+    Value: !Ref SubnetB
+    Export: { Name: !Sub "${AWS::StackName}-SubnetB" }
+  NatIpAddress:
+    Description: Allow this address in Google Workspace → Apps → Gmail → Routing → SMTP relay service
+    Value: !Ref NatEip
+  AppSecurityGroup:
+    Description: Attach the Lambda function to this group
+    Value: !GetAtt AppSecurityGroup.GroupId
+    Export: { Name: !Sub "${AWS::StackName}-AppSecurityGroup" }
