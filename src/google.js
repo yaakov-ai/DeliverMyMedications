@@ -8,6 +8,21 @@ import { randomSecret, verifyTotp, otpauthUrl, makeRecoveryCodes, useRecoveryCod
 const STAFF_DAYS = 1;                 // staff sessions are short; pharmacies share screens
 const cookie = (value, maxAge) => `dmm_staff=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
 const base = env => (env.PUBLIC_URL || "").replace(/\/$/, "");
+/* A JWT payload is base64url: the padding depends on its length, and Workers' atob rejects a wrong guess. */
+function decodeJwt(idToken) {
+  try {
+    const part = String(idToken).split(".")[1];
+    if (!part) return null;
+    const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const bytes = Uint8Array.from(atob(padded), c => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch (e) {
+    console.log("jwt decode", e.message);
+    return null;
+  }
+}
+
 export const googleEnabled = env => !!(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET) && ["google", "both"].includes(env.AUTH_MODE || "google");
 
 export async function staffSession(req, env) {
@@ -61,7 +76,8 @@ export const googleRoutes = {
     });
     const tok = await r.json();
     if (!r.ok || !tok.id_token) return deny("Google couldn't confirm that sign-in.");
-    const claims = JSON.parse(atob(tok.id_token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/") + "=="));
+    const claims = decodeJwt(tok.id_token);
+    if (!claims) return deny("Google's reply couldn't be read. Try again.");
     if (claims.aud !== env.GOOGLE_CLIENT_ID || !claims.email_verified) return deny("That Google account can't be used here.");
     if (env.GOOGLE_HD && claims.hd !== env.GOOGLE_HD) return deny(`Use your ${env.GOOGLE_HD} account.`);
     const email = String(claims.email).toLowerCase();
