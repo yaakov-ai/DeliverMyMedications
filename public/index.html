@@ -875,7 +875,7 @@ body.live .demo-only{display:none!important}
       <a href="#/switch">Switch to us</a>
       <a href="#/#faq">FAQ</a>
     </nav>
-    <a class="btn-refill" href="#/account">Get refill</a>
+    <a class="btn-refill" href="#/account" id="refillBtn">Get refill</a>
     <a class="btn-signin" href="#/signin" id="signinBtn">Sign in</a>
     <a class="icon-btn" href="#/browse" aria-label="Search medications">
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
@@ -6277,7 +6277,9 @@ const sAuth = { step: "start", token: "", to: "#/pharmacy", err: "", secret: "",
 function viewStaffSignin(params) {
   if (!isLive()) return liveMsg("Staff sign-in", "Staff sign-in works on the hosted site, not in this demo.");
   const e = params.get("e"); if (e && !sAuth.err) sAuth.err = e;
-  const t = params.get("t"); if (t && sAuth.token !== t) Object.assign(sAuth, { token: t, step: params.get("step") === "setup" ? "setup" : "code", to: params.get("to") || "#/pharmacy", err: "" });
+  const t = params.get("t");
+  if (!t && !sAuth.token && sAuth.step !== "start") Object.assign(sAuth, { step: "start", secret: null, codes: null });
+  if (t && sAuth.token !== t) Object.assign(sAuth, { token: t, step: params.get("step") === "setup" ? "setup" : "code", to: params.get("to") || "#/pharmacy", err: "" });
   const shell = (title, sub, inner) => `<div class="wrap"><div class="auth-card"><div class="auth-mark">${ICON.tick}</div><h1>${title}</h1><p class="muted">${sub}</p>
     ${sAuth.err ? `<div class="form-alert show">${esc(sAuth.err)}</div>` : ""}${inner}</div></div>`;
   if (sAuth.step === "setup" && !sAuth.secret) return shell("Set up your authenticator", "Loading…", "");
@@ -6296,7 +6298,7 @@ function viewStaffSignin(params) {
   if (sAuth.step === "codes") return `<div class="wrap"><div class="auth-card"><h1>Save your recovery codes</h1>
     <p class="muted">If you lose your phone, one of these gets you back in. Each works once.</p>
     <div class="codes">${sAuth.codes.map(c => `<code>${esc(c)}</code>`).join("")}</div>
-    <button class="btn btn-primary btn-block" style="margin-top:14px" onclick="location.hash=sAuth.to||'#/pharmacy'">I've saved them</button></div></div>`;
+    <button class="btn btn-primary btn-block" style="margin-top:14px" onclick="staffDone()">I've saved them</button></div></div>`;
   return shell("Staff sign-in", "Providers, pharmacists and administrators sign in with their work Google account.",
     `<a class="btn btn-primary btn-block gbtn" href="/auth/google/start?to=${encodeURIComponent(parse().params.get("to") || "#/pharmacy")}">
        <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#4285F4" d="M45 24c0-1.6-.1-2.7-.4-3.9H24v7.1h12c-.2 1.9-1.5 4.7-4.4 6.6l6.7 5.2C42.2 35.5 45 30.3 45 24z"/><path fill="#34A853" d="M24 46c5.9 0 10.9-1.9 14.5-5.3l-6.9-5.3c-1.9 1.3-4.4 2.2-7.6 2.2-5.8 0-10.7-3.8-12.4-9.1l-7.1 5.5C8.1 41.1 15.5 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.5c-.5-1.4-.7-2.9-.7-4.5s.3-3.1.7-4.5l-7.1-5.5C3 17 2 20.4 2 24s1 7 2.5 10l7.1-5.5z"/><path fill="#EA4335" d="M24 10.6c3.3 0 5.5 1.4 6.8 2.6l5.9-5.8C33.1 4.1 29.9 2 24 2 15.5 2 8.1 6.9 4.5 14l7.1 5.5c1.7-5.3 6.6-8.9 12.4-8.9z"/></svg>
@@ -6325,6 +6327,14 @@ async function staffMfa(method) {
     if (j.recoveryCodes) { sAuth.codes = j.recoveryCodes; sAuth.step = "codes"; route(true); return; }
     LIVE.scope = null; location.hash = sAuth.to; route(true);
   } catch (e) { sAuth.busy = false; sAuth.err = e.message; route(true); }
+}
+/* Finished setting up: drop the one-time sign-in state before moving on. */
+function staffDone(){
+  const to = sAuth.to || "#/pharmacy";
+  Object.assign(sAuth, { step: "start", token: null, secret: null, url: "", codes: null, err: "", busy: false });
+  LIVE.scope = null;
+  location.hash = to;
+  route(true);
 }
 async function staffSignOut() { await apiCall("/api/staff/logout", {}); LIVE.db = null; LIVE.scope = null; adm.data = null; location.hash = "#/"; toast("Signed out"); }
 
@@ -6912,11 +6922,27 @@ async function boot(){
   route();
   updateSignIn();
 }
+/* Who is signed in, and where their home is — patients and every staff role alike. */
+const PORTAL_HOME={admin:"#/admin",provider:"#/provider",pharmacist:"#/pharmacy",technician:"#/pharmacy",support:"#/pharmacy"};
 function updateSignIn(){
-  const b=$("#signinBtn");if(!b)return;
-  const inLive=isLive()&&LIVE.scope==="patient";
-  b.textContent=inLive?"My account":"Sign in";
-  b.href=inLive?"#/account":"#/signin";
+  const b=$("#signinBtn"),r=$("#refillBtn");if(!b)return;
+  const live=isLive();
+  const me=live?LIVE.me:null;
+  const staff=live&&LIVE.scope==="staff"&&me;
+  const patient=live&&LIVE.scope==="patient";
+  if(staff){
+    const home=me.owner?"#/admin":(PORTAL_HOME[me.role]||"#/pharmacy");
+    b.textContent=(me.name||"").split(" ")[0]||"My portal";
+    b.href=home;
+    b.title=`Signed in as ${me.name||me.email} (${me.owner?"owner":me.role})`;
+    if(r){r.textContent="Sign out";r.href="javascript:void(0)";r.onclick=staffSignOut}
+  }else if(patient){
+    b.textContent="My account";b.href="#/account";b.title="";
+    if(r){r.textContent="Get refill";r.href="#/account";r.onclick=null}
+  }else{
+    b.textContent="Sign in";b.href="#/signin";b.title="";
+    if(r){r.textContent="Get refill";r.href="#/account";r.onclick=null}
+  }
 }
 boot();
 </script>
