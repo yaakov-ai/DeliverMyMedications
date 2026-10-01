@@ -25,7 +25,7 @@
   --ink:#e6efea; --muted:#9db0a7; --line:#27362f; --line-2:#3a4c44; --warn:#2c2613; --warn-line:#7a6526;
 }
 *{box-sizing:border-box}
-html{scroll-behavior:smooth}
+html{scroll-behavior:auto}
 img,svg,table{max-width:100%}
 #app{overflow-x:hidden}
 @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{transition:none!important;animation:none!important}}
@@ -1471,6 +1471,12 @@ function parse(){
   return {parts:path.split("/").filter(Boolean),params:new URLSearchParams(qs||""),anchor};
 }
 function browseSearch(q,cat){const u=new URLSearchParams();if(cat&&cat!=="all")u.set("cat",cat);if(q.trim())u.set("q",q.trim());const s=u.toString();location.hash="#/browse"+(s?"?"+s:"")}
+/* Put a new page at the top immediately — no animation, and covering every engine. */
+function toTop(){
+  try{ window.scrollTo({top:0,left:0,behavior:"instant"}); }catch{ window.scrollTo(0,0); }
+  document.documentElement.scrollTop=0;
+  document.body.scrollTop=0;
+}
 function route(keep){
   setTimeout(updateSignIn,0);
   const {parts,params,anchor}=parse();
@@ -1487,7 +1493,7 @@ function route(keep){
     }}
   }
   closeModal(true);
-  if(v===""){app.innerHTML=viewHome();top5Start();if(anchor){setTimeout(()=>document.getElementById(anchor)?.scrollIntoView(),0);return}}
+  if(v===""){app.innerHTML=viewHome();top5Start();if(anchor){setTimeout(()=>document.getElementById(anchor)?.scrollIntoView({behavior:"smooth",block:"start"}),0);return}}
   else if(v==="browse")app.innerHTML=viewBrowse(params);
   else if(v==="p"&&byId[parts[1]]){app.innerHTML=viewProduct(byId[parts[1]]);if(document.getElementById("disRange")){dissolveDemo.done=false;dissolveDemo()}}
   else if(v==="cart"){applyPromoFromUrl();app.innerHTML=viewCart()}
@@ -1513,10 +1519,11 @@ function route(keep){
   document.body.classList.toggle("portal",v==="provider"||v==="pharmacy");
   document.querySelectorAll(".demobar a").forEach(x=>x.setAttribute("aria-current",x.dataset.v===(["account","provider","pharmacy","campaigns","admin"].includes(v)?v:"")?"page":"false"));
   if(v==="checkout")payments.mount(totals().total);
-  if(!keep)window.scrollTo(0,0);
+  if(!keep)toTop();
   document.title=(v==="p"&&byId[parts[1]]?byId[parts[1]].name+" — ":"")+"DeliverMyMedications";
 }
-window.addEventListener("hashchange",route);
+if("scrollRestoration" in history)history.scrollRestoration="manual";
+window.addEventListener("hashchange",()=>route());
 
 /* ============ VIEWS ============ */
 function card(p){
