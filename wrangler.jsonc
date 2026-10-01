@@ -5,6 +5,12 @@
   "compatibility_date": "2025-09-01",
   "workers_dev": true,
 
+  // The live domain, kept here so the attachment lives in the repo rather than a dashboard setting.
+  "routes": [
+    { "pattern": "delivermymedications.com", "custom_domain": true },
+    { "pattern": "www.delivermymedications.com", "custom_domain": true }
+  ],
+
   // Builds src/generated/catalog.json from public/index.html so the server prices match the site.
   "build": { "command": "node scripts/build.mjs" },
 

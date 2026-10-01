@@ -827,9 +827,11 @@ export default {
       console.log("error", key, e && e.stack || e);
       // Sign-in pages are browser navigations: send people back to the site with a readable reason.
       if (url.pathname.startsWith("/auth/") || url.pathname.startsWith("/staff/")) {
-        const hint = /no such table|no such column/i.test(String(e && e.message))
-          ? "The database is missing a table. Run migrations/0003_staff_login.sql in your D1 console."
-          : "Sign-in failed. Check the Worker logs for details.";
+        // Say what actually went wrong: chasing these through the log viewer wastes everyone's time.
+        const raw = String((e && e.message) || e).slice(0, 160);
+        const hint = /no such table|no such column/i.test(raw)
+          ? `Database: ${raw}. Run the migration files in your D1 console.`
+          : `Sign-in failed: ${raw}`;
         return new Response(null, { status: 302, headers: { Location: `${url.origin}/#/staff-signin?e=${encodeURIComponent(hint)}` } });
       }
       return json({ error: "Something went wrong. Please try again." }, 500);
