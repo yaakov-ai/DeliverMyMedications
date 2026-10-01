@@ -339,8 +339,8 @@ body.portal{background:var(--paper)}
 .portal-top .logo-mark{background:var(--green)}
 .pt-right{display:flex;gap:10px 16px;align-items:center;flex-wrap:wrap}
 .pt-stat{color:#cfe6da}.pt-stat b{color:#fff;font-size:1.1rem;margin-right:3px}
-.live{display:flex;align-items:center;gap:6px;font-weight:700;font-size:.85rem;color:#bff0cf}
-.live i{width:9px;height:9px;border-radius:50%;background:#4ade80;box-shadow:0 0 0 0 rgba(74,222,128,.7);animation:ping 1.8s infinite}
+.livepill{display:flex;align-items:center;gap:6px;font-weight:700;font-size:.85rem;color:#bff0cf}
+.livepill i{width:9px;height:9px;border-radius:50%;background:#4ade80;box-shadow:0 0 0 0 rgba(74,222,128,.7);animation:ping 1.8s infinite}
 @keyframes ping{70%{box-shadow:0 0 0 8px rgba(74,222,128,0)}100%{box-shadow:0 0 0 0 rgba(74,222,128,0)}}
 
 /* Provider: three panes */
@@ -3525,7 +3525,7 @@ function viewProvider(){
   if(!pv.sel&&L.waiting[0])pv.sel=L.waiting[0].id;
   return `<div class="portal-top">
     <div class="pt-left"><div class="logo-mark">Rx</div><div><strong>Provider workspace</strong><small>${esc(PROVIDER.name)} · NPI ${esc(PROVIDER.npi)} · ${PROVIDER.states.length?`Licensed in ${PROVIDER.states.join(", ")}`:"All states (admin view)"}</small></div></div>
-    <div class="pt-right"><span class="live"><i></i>Live queue</span><span class="pt-stat"><b>${L.waiting.length}</b> waiting</span><span class="pt-stat"><b>${L.signed.length}</b> signed today</span>${(p=>`<span class="pt-stat"><b>${money(p.unpaid)}</b> unpaid · ${money(p.month)} this month</span>`)(pvPay(db))}
+    <div class="pt-right"><span class="livepill"><i></i>Live queue</span><span class="pt-stat"><b>${L.waiting.length}</b> waiting</span><span class="pt-stat"><b>${L.signed.length}</b> signed today</span>${(p=>`<span class="pt-stat"><b>${money(p.unpaid)}</b> unpaid · ${money(p.month)} this month</span>`)(pvPay(db))}
       <button class="btn btn-light" style="padding:8px 14px" onclick="pv.pay=!pv.pay;pv.sel=pv.pay?null:pv.sel;route(true)">Getting paid</button>
       ${CONFIG.staffAuth==="google"?`<button class="btn btn-ghost" style="padding:8px 14px;color:#fff" onclick="staffSignOut()">Sign out</button>`:""}
       ${!db.orders.length?`<button class="btn btn-light demo-only" style="padding:8px 14px" onclick="seedDemo()">Load sample orders</button>`:""}</div>
@@ -4800,7 +4800,7 @@ function viewPharmacy(){
   else body=L[ph.view].length?`<div class="todo">${L[ph.view].map(f=>fillCard(db,f)).join("")}</div>`:`<div class="q-empty">Nothing here.</div>`;
   return `<div class="portal-top">
     <div class="pt-left"><div class="logo-mark">Rx</div><div><strong>Pharmacy fulfillment</strong><small>${isOpenNow()?"Open now":"Closed now, opens "+nextOpen(new Date()).toLocaleString([], {timeZone:"America/New_York",weekday:"short",hour:"numeric"})+" ET"} · Mon–Fri 9–5 ET · ${esc(cutoffLabel())}</small></div></div>
-    <div class="pt-right"><span class="live"><i></i>Live</span><span class="pt-stat"><b>${urgentOpen}</b> urgent</span>
+    <div class="pt-right"><span class="livepill"><i></i>Live</span><span class="pt-stat"><b>${urgentOpen}</b> urgent</span>
       <button class="btn btn-light" style="padding:8px 14px" onclick="linkNew()">+ Enter Rx</button>
       ${CONFIG.staffAuth==="google"?`<button class="btn btn-ghost" style="padding:8px 14px;color:#fff" onclick="staffSignOut()">Sign out</button>`:""}
       ${!db.orders.length?`<button class="btn btn-ghost demo-only" style="padding:8px 14px;color:#fff" onclick="seedDemo()">Load sample orders</button>`:""}</div>
