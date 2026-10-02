@@ -2065,29 +2065,32 @@ function qField(itemId, q) {
     return `<div class="q">${label}<div class="q-opts">
       ${opts.map(o => `<button type="button" class="q-opt" aria-pressed="${v.value === o}" onclick="${set},{value:${JSON.stringify(o).replace(/"/g, "&quot;")}})">${esc(o)}</button>`).join("")}
       ${q.other ? `<button type="button" class="q-opt" aria-pressed="${otherOpen}" onclick="${set},{value:'Other',other:''})">Other</button>` : ""}
-    </div>${otherOpen ? `<input class="input q-other" placeholder="Tell us in your own words" value="${esc(v.other)}" oninput="${set},{value:'Other',other:this.value},true)">` : ""}</div>`;
+    </div>${otherOpen ? `<input class="input q-other" placeholder="Tell us in your own words" value="${esc(v.other)}" oninput="${set},{other:this.value},true)">` : ""}</div>`;
   }
   if (q.type === "multi") {
     const chosen = v.values || [];
     return `<div class="q">${label}<div class="q-opts">
       ${q.options.map(o => `<button type="button" class="q-opt" aria-pressed="${chosen.includes(o)}" onclick="intakeToggle('${itemId}','${q.id}',${JSON.stringify(o).replace(/"/g, "&quot;")})">${esc(o)}</button>`).join("")}
       ${q.other ? `<button type="button" class="q-opt" aria-pressed="${otherOpen}" onclick="${set},{values:${JSON.stringify(chosen).replace(/"/g, "&quot;")},other:'')})">Other</button>` : ""}
-    </div>${otherOpen ? `<input class="input q-other" placeholder="Tell us in your own words" value="${esc(v.other)}" oninput="${set},{values:${JSON.stringify(chosen).replace(/"/g, "&quot;")},other:this.value},true)">` : ""}</div>`;
+    </div>${otherOpen ? `<input class="input q-other" placeholder="Tell us in your own words" value="${esc(v.other)}" oninput="${set},{other:this.value},true)">` : ""}</div>`;
   }
   if (q.type === "number") {
     return `<div class="q">${label}<div class="q-num"><input class="input" inputmode="decimal" value="${esc(v.value ?? "")}" oninput="${set},{value:this.value},true)"><span>${esc(q.unit || "")}</span></div></div>`;
   }
   if (q.type === "height") {
     return `<div class="q">${label}<div class="q-num">
-      <input class="input" inputmode="numeric" placeholder="ft" value="${esc(v.ft ?? "")}" oninput="${set},{ft:this.value,in:${JSON.stringify(v.in ?? "")}},true)"><span>ft</span>
-      <input class="input" inputmode="numeric" placeholder="in" value="${esc(v.in ?? "")}" oninput="${set},{ft:${JSON.stringify(v.ft ?? "")},in:this.value},true)"><span>in</span></div></div>`;
+      <input class="input" inputmode="numeric" placeholder="ft" value="${esc(v.ft ?? "")}" oninput="${set},{ft:this.value},true)"><span>ft</span>
+      <input class="input" inputmode="numeric" placeholder="in" value="${esc(v.in ?? "")}" oninput="${set},{in:this.value},true)"><span>in</span></div></div>`;
   }
   return `<div class="q">${label}<textarea class="input" rows="2" maxlength="400" oninput="${set},{value:this.value},true)">${esc(v.value || "")}</textarea></div>`;
 }
 const intake = { answers: {} };
 function intakeSet(itemId, qid, val, quiet) {
   const a = intake.answers[itemId] = intake.answers[itemId] || {};
-  a[qid] = { ...(val.other !== undefined || val.values ? {} : a[qid]), ...val };
+  const prev = a[qid] || {};
+  // Picking a single-choice option replaces the answer; everything else merges into it.
+  const replacing = val.value !== undefined && val.value !== "Other";
+  a[qid] = replacing ? { ...val } : { ...prev, ...val };
   if (!quiet) renderConsentStep();
 }
 function intakeToggle(itemId, qid, option) {
@@ -2102,7 +2105,7 @@ function intakeMissing(p) {
     if (!q.required) return false;
     const v = qVal(p.id, q.id) || {};
     if (q.type === "multi") return !(v.values || []).length && !v.other;
-    if (q.type === "height") return !(v.ft && v.in !== undefined && v.in !== "");
+    if (q.type === "height") return !String(v.ft ?? "").trim();
     return v.value === undefined || String(v.value).trim() === "" || (v.value === "Other" && !String(v.other || "").trim());
   });
 }
@@ -2111,7 +2114,7 @@ function intakeSummary(p) {
     const v = qVal(p.id, q.id) || {};
     let answer = "";
     if (q.type === "multi") answer = [...(v.values || []), v.other ? `Other: ${v.other}` : ""].filter(Boolean).join(", ");
-    else if (q.type === "height") answer = v.ft ? `${v.ft} ft ${v.in || 0} in` : "";
+    else if (q.type === "height") answer = v.ft ? `${v.ft} ft ${Number(v.in) || 0} in` : "";
     else answer = v.value === "Other" ? `Other: ${v.other || ""}` : (v.value ?? "");
     if (q.unit && answer !== "") answer += ` ${q.unit}`;
     return answer === "" ? null : { q: q.q, a: String(answer) };
@@ -2587,9 +2590,9 @@ function finderNext() {
   const F = FINDERS[finder.key], q = F.qs[finder.i];
   const v = (finder.answers[q.id]) || {};
   const empty = q.type === "multi" ? !(v.values || []).length && !v.other
-    : q.type === "height" ? !(v.ft && v.in !== undefined && v.in !== "")
+    : q.type === "height" ? !String(v.ft ?? "").trim()
       : v.value === undefined || String(v.value).trim() === "";
-  if (q.required && empty) return toast("Pick an answer to carry on.");
+  if (q.required && empty) return toast(`Please answer: ${q.q}`);
   if (finder.i < F.qs.length - 1) { finder.i++; route(true); return; }
   finder.done = F.decide(finder.answers);
   route(true);
@@ -2630,7 +2633,7 @@ async function finderSave() {
   const summary = FINDERS[finder.key].qs.map(q => {
     const v = finder.answers[q.id] || {};
     const a = q.type === "multi" ? [...(v.values || []), v.other].filter(Boolean).join(", ")
-      : q.type === "height" ? `${v.ft || ""} ft ${v.in || ""} in` : (v.value ?? "");
+      : q.type === "height" ? (v.ft ? `${v.ft} ft ${Number(v.in) || 0} in` : "") : (v.value ?? "");
     return { q: q.q, a: String(a) };
   }).filter(x => x.a);
   try {
